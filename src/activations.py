@@ -11,9 +11,6 @@ from sklearn.metrics import accuracy_score
 def get_gpt2_layer(model, layer_idx: int):
     """
     Return a GPT-2 transformer block.
-
-    GPT-2 exposes transformer blocks through:
-        model.transformer.h[layer_idx]
     """
     return model.transformer.h[layer_idx]
 
@@ -27,11 +24,11 @@ def collect_last_token_activation(
     layer_idx: int
 ) -> np.ndarray:
     """
-    Collect the final-token hidden representation from one GPT-2 layer
-    for each input text.
+    Collect the final-token hidden representation from a GPT-2 layer.
 
     Returns:
-        shape = [n_examples, hidden_size]
+        NumPy array with shape:
+        [number_of_examples, hidden_size]
     """
 
     activations = []
@@ -53,11 +50,39 @@ def collect_last_token_activation(
         captured = {}
 
         def hook(module, inputs, output):
-            # GPT-2 blocks return tuples.
-            hidden_states = output[0]
+            """
+            GPT-2 transformer blocks return:
+                hidden_states
+            or, depending on Transformers version/configuration,
+                (hidden_states, ...)
+            """
+
+            if isinstance(output, tuple):
+                hidden_states = output[0]
+            else:
+                hidden_states = output
+
+            # We expect:
+            # [batch, sequence_length, hidden_size]
+            #
+            # But some model/config combinations can give a
+            # different shape, so explicitly check it.
+            if hidden_states.ndim == 3:
+                final_token = hidden_states[:, -1, :]
+
+            elif hidden_states.ndim == 2:
+                # Fallback:
+                # [sequence_length, hidden_size]
+                final_token = hidden_states[-1, :].unsqueeze(0)
+
+            else:
+                raise RuntimeError(
+                    f"Unexpected activation shape: "
+                    f"{tuple(hidden_states.shape)}"
+                )
 
             captured["activation"] = (
-                hidden_states[:, -1, :]
+                final_token
                 .detach()
                 .cpu()
             )
@@ -70,6 +95,7 @@ def collect_last_token_activation(
             handle.remove()
 
         activation = captured["activation"][0].numpy()
+
         activations.append(activation)
 
     return np.stack(activations)
@@ -82,12 +108,7 @@ def train_linear_probe(
     test_labels: np.ndarray
 ):
     """
-    Train a linear probe on hidden representations.
-
-    Returns:
-        classifier
-        test_accuracy
-        normalized_direction
+    Train a linear classifier over internal activations.
     """
 
     classifier = LogisticRegression(
@@ -115,7 +136,11 @@ def train_linear_probe(
         np.linalg.norm(direction) + 1e-12
     )
 
-    return classifier, accuracy, direction
+    return (
+        classifier,
+        accuracy,
+        direction
+    )
 
 
 def find_best_layer(
@@ -128,8 +153,8 @@ def find_best_layer(
     device
 ):
     """
-    Evaluate each transformer layer and identify the layer
-    whose representations best linearly predict sentiment.
+    Evaluate all GPT-2 layers and find the layer
+    where sentiment is most linearly recoverable.
     """
 
     num_layers = model.config.n_layer
@@ -172,7 +197,7 @@ def find_best_layer(
 
         results.append({
             "layer": layer_idx,
-            "accuracy": accuracy
+            "accuracy": float(accuracy)
         })
 
         cached_train[layer_idx] = train_acts
