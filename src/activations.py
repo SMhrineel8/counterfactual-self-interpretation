@@ -21,10 +21,13 @@ def collect_last_token_activation(
     tokenizer,
     model,
     device: torch.device,
-    layer_idx: int
+    layer_idx: int,
+    batch_size: int = 16
 ) -> np.ndarray:
     """
     Collect the final-token hidden representation from a GPT-2 layer.
+
+    Uses batched inference to make activation extraction much faster.
 
     Returns:
         NumPy array with shape:
@@ -35,26 +38,27 @@ def collect_last_token_activation(
 
     layer = get_gpt2_layer(model, layer_idx)
 
-    for text in texts:
+    for start in range(0, len(texts), batch_size):
 
-        prompt = (
-            f"Review: {text}\n"
-            f"Sentiment:"
-        )
+        batch_texts = texts[start:start + batch_size]
+
+        prompts = [
+            f"Review: {text}\nSentiment:"
+            for text in batch_texts
+        ]
 
         inputs = tokenizer(
-            prompt,
-            return_tensors="pt"
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True
         ).to(device)
 
         captured = {}
 
-        def hook(module, inputs, output):
+        def hook(module, hook_inputs, output):
             """
-            GPT-2 transformer blocks return:
-                hidden_states
-            or, depending on Transformers version/configuration,
-                (hidden_states, ...)
+            Capture the final non-padding token representation.
             """
 
             if isinstance(output, tuple):
@@ -62,27 +66,33 @@ def collect_last_token_activation(
             else:
                 hidden_states = output
 
-            # We expect:
-            # [batch, sequence_length, hidden_size]
-            #
-            # But some model/config combinations can give a
-            # different shape, so explicitly check it.
-            if hidden_states.ndim == 3:
-                final_token = hidden_states[:, -1, :]
-
-            elif hidden_states.ndim == 2:
-                # Fallback:
-                # [sequence_length, hidden_size]
-                final_token = hidden_states[-1, :].unsqueeze(0)
-
-            else:
+            if hidden_states.ndim != 3:
                 raise RuntimeError(
-                    f"Unexpected activation shape: "
+                    "Expected activation tensor with shape "
+                    "[batch, sequence, hidden], but got "
                     f"{tuple(hidden_states.shape)}"
                 )
 
+            # Find the actual final token for every item in the batch.
+            attention_mask = inputs["attention_mask"]
+
+            last_positions = (
+                attention_mask.sum(dim=1) - 1
+            )
+
+            batch_indices = torch.arange(
+                hidden_states.size(0),
+                device=hidden_states.device
+            )
+
+            final_tokens = hidden_states[
+                batch_indices,
+                last_positions,
+                :
+            ]
+
             captured["activation"] = (
-                final_token
+                final_tokens
                 .detach()
                 .cpu()
             )
@@ -94,11 +104,19 @@ def collect_last_token_activation(
         finally:
             handle.remove()
 
-        activation = captured["activation"][0].numpy()
+        if "activation" not in captured:
+            raise RuntimeError(
+                "The activation hook did not capture any output."
+            )
 
-        activations.append(activation)
+        activations.append(
+            captured["activation"].numpy()
+        )
 
-    return np.stack(activations)
+    return np.concatenate(
+        activations,
+        axis=0
+    )
 
 
 def train_linear_probe(
@@ -109,6 +127,11 @@ def train_linear_probe(
 ):
     """
     Train a linear classifier over internal activations.
+
+    Returns:
+        classifier
+        test_accuracy
+        normalized_direction
     """
 
     classifier = LogisticRegression(
@@ -150,11 +173,14 @@ def find_best_layer(
     test_labels,
     tokenizer,
     model,
-    device
+    device,
+    batch_size: int = 16
 ):
     """
-    Evaluate all GPT-2 layers and find the layer
-    where sentiment is most linearly recoverable.
+    Evaluate GPT-2 layers and find the layer where
+    sentiment is most linearly recoverable.
+
+    Activation extraction is batched for efficiency.
     """
 
     num_layers = model.config.n_layer
@@ -173,7 +199,8 @@ def find_best_layer(
             tokenizer,
             model,
             device,
-            layer_idx
+            layer_idx,
+            batch_size=batch_size
         )
 
         test_acts = collect_last_token_activation(
@@ -181,7 +208,8 @@ def find_best_layer(
             tokenizer,
             model,
             device,
-            layer_idx
+            layer_idx,
+            batch_size=batch_size
         )
 
         (
